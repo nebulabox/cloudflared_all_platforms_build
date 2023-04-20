@@ -40,6 +40,6 @@ pushd release
 for entry in *
 do
   echo "Packing : ${entry%.*}.tar.xz"
-  tar cvfJ ${entry%.*}.tar.xz $entry && rm $entry
+  COPYFILE_DISABLE=1 tar cvfJ ${entry%.*}.tar.xz $entry && rm $entry
 done
 popd
