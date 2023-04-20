@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
@@ -19,6 +20,9 @@ const (
 	// value will return this error to incoming requests.
 	StatusSessionLimitExceeded websocket.StatusCode = 4002
 	reasonSessionLimitExceeded                      = "limit exceeded for streaming sessions"
+
+	StatusIdleLimitExceeded websocket.StatusCode = 4003
+	reasonIdleLimitExceeded                      = "session was idle for too long"
 )
 
 type ManagementService struct {
@@ -96,12 +100,7 @@ func (m *ManagementService) streamLogs(c *websocket.Conn, ctx context.Context, s
 		case event := <-session.listener:
 			err := WriteEvent(c, ctx, &EventLog{
 				ServerEvent: ServerEvent{Type: Logs},
-				Logs: []Log{{
-					Event:     Cloudflared,
-					Timestamp: event.Time,
-					Level:     event.Level,
-					Message:   event.Message,
-				}},
+				Logs:        []*Log{event},
 			})
 			if err != nil {
 				// If the client (or the server) already closed the connection, don't attempt to close it again
@@ -132,13 +131,13 @@ func (m *ManagementService) startStreaming(c *websocket.Conn, ctx context.Contex
 		return
 	}
 	// Expect the first incoming request
-	_, ok := IntoClientEvent[EventStartStreaming](event, StartStreaming)
+	startEvent, ok := IntoClientEvent[EventStartStreaming](event, StartStreaming)
 	if !ok {
-		m.log.Err(c.Close(StatusInvalidCommand, reasonInvalidCommand)).Msgf("expected start_streaming as first recieved event")
+		m.log.Warn().Err(c.Close(StatusInvalidCommand, reasonInvalidCommand)).Msgf("expected start_streaming as first recieved event")
 		return
 	}
 	m.streaming.Store(true)
-	listener := m.logger.Listen()
+	listener := m.logger.Listen(startEvent.Filters)
 	m.log.Debug().Msgf("Streaming logs")
 	go m.streamLogs(c, ctx, listener)
 }
@@ -152,9 +151,19 @@ func (m *ManagementService) logs(w http.ResponseWriter, r *http.Request) {
 	}
 	// Make sure the connection is closed if other go routines fail to close the connection after completing.
 	defer c.Close(websocket.StatusInternalError, "")
-	ctx := r.Context()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 	events := make(chan *ClientEvent)
 	go m.readEvents(c, ctx, events)
+
+	// Send a heartbeat ping to hold the connection open even if not streaming.
+	ping := time.NewTicker(15 * time.Second)
+	defer ping.Stop()
+
+	// Close the connection if no operation has occurred after the idle timeout.
+	idleTimeout := 5 * time.Minute
+	idle := time.NewTimer(idleTimeout)
+	defer idle.Stop()
 
 	for {
 		select {
@@ -165,9 +174,11 @@ func (m *ManagementService) logs(w http.ResponseWriter, r *http.Request) {
 		case event := <-events:
 			switch event.Type {
 			case StartStreaming:
+				idle.Stop()
 				m.startStreaming(c, ctx, event)
 				continue
 			case StopStreaming:
+				idle.Reset(idleTimeout)
 				// TODO: limit StopStreaming to only halt streaming for clients that are already streaming
 				m.streaming.Store(false)
 			case UnknownClientEventType:
@@ -181,6 +192,11 @@ func (m *ManagementService) logs(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
+		case <-ping.C:
+			go c.Ping(ctx)
+		case <-idle.C:
+			c.Close(StatusIdleLimitExceeded, reasonIdleLimitExceeded)
+			return
 		}
 	}
 }
