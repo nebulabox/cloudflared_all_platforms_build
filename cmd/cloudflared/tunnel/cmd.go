@@ -29,6 +29,7 @@ import (
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/credentials"
+	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/logger"
@@ -95,6 +96,7 @@ Eg. cloudflared tunnel --url localhost:8080/.
 Please note that Quick Tunnels are meant to be ephemeral and should only be used for testing purposes.
 For production usage, we recommend creating Named Tunnels. (https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/)
 `
+	connectorLabelFlag = "label"
 )
 
 var (
@@ -399,7 +401,21 @@ func StartServer(
 
 	localRules := []ingress.Rule{}
 	if features.Contains(features.FeatureManagementLogs) {
-		mgmt := management.New(c.String("management-hostname"), logger.ManagementLogger.Log, logger.ManagementLogger)
+		serviceIP := c.String("service-op-ip")
+		if edgeAddrs, err := edgediscovery.ResolveEdge(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion); err == nil {
+			if serviceAddr, err := edgeAddrs.GetAddrForRPC(); err == nil {
+				serviceIP = serviceAddr.TCP.String()
+			}
+		}
+
+		mgmt := management.New(
+			c.String("management-hostname"),
+			serviceIP,
+			clientID,
+			c.String(connectorLabelFlag),
+			logger.ManagementLogger.Log,
+			logger.ManagementLogger,
+		)
 		localRules = []ingress.Rule{ingress.NewManagementRule(mgmt)}
 	}
 	orchestrator, err := orchestration.NewOrchestrator(ctx, orchestratorConfig, tunnelConfig.Tags, localRules, tunnelConfig.Log)
@@ -667,6 +683,11 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Value:  4,
 			Hidden: true,
 		}),
+		altsrc.NewStringFlag(&cli.StringFlag{
+			Name:  connectorLabelFlag,
+			Usage: "Use this option to give a meaningful label to a specific connector. When a tunnel starts up, a connector id unique to the tunnel is generated. This is a uuid. To make it easier to identify a connector, we will use the hostname of the machine the tunnel is running on along with the connector ID. This option exists if one wants to have more control over what their individual connectors are called.",
+			Value: "",
+		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
 			Name:    "grace-period",
 			Usage:   "When cloudflared receives SIGINT/SIGTERM it will stop accepting new requests, wait for in-progress requests to terminate, then shutdown. Waiting for in-progress requests will timeout after this grace period, or when a second SIGTERM/SIGINT is received.",
@@ -906,6 +927,13 @@ func configureProxyFlags(shouldHide bool) []cli.Flag {
 			EnvVars: []string{"TUNNEL_MANAGEMENT_HOSTNAME"},
 			Hidden:  true,
 			Value:   "management.argotunnel.com",
+		}),
+		altsrc.NewStringFlag(&cli.StringFlag{
+			Name:    "service-op-ip",
+			Usage:   "Fallback IP for service operations run by the management service.",
+			EnvVars: []string{"TUNNEL_SERVICE_OP_IP"},
+			Hidden:  true,
+			Value:   "198.41.200.113:80",
 		}),
 	}
 	return append(flags, sshFlags(shouldHide)...)

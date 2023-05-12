@@ -32,6 +32,38 @@ func Init(bi *cliutil.BuildInfo) {
 }
 
 func Command() *cli.Command {
+	subcommands := []*cli.Command{
+		buildTailManagementTokenSubcommand(),
+	}
+
+	return buildTailCommand(subcommands)
+}
+
+func buildTailManagementTokenSubcommand() *cli.Command {
+	return &cli.Command{
+		Name:        "token",
+		Action:      cliutil.ConfiguredAction(managementTokenCommand),
+		Usage:       "Get management access jwt",
+		UsageText:   "cloudflared tail token TUNNEL_ID",
+		Description: `Get management access jwt for a tunnel`,
+		Hidden:      true,
+	}
+}
+
+func managementTokenCommand(c *cli.Context) error {
+	log := createLogger(c)
+	token, err := getManagementToken(c, log)
+	if err != nil {
+		return err
+	}
+	var tokenResponse = struct {
+		Token string `json:"token"`
+	}{Token: token}
+
+	return json.NewEncoder(os.Stdout).Encode(tokenResponse)
+}
+
+func buildTailCommand(subcommands []*cli.Command) *cli.Command {
 	return &cli.Command{
 		Name:      "tail",
 		Action:    Run,
@@ -51,15 +83,27 @@ func Command() *cli.Command {
 			},
 			&cli.StringFlag{
 				Name:    "level",
-				Usage:   "Filter by specific log levels (debug, info, warn, error)",
+				Usage:   "Filter by specific log levels (debug, info, warn, error). Filters by debug log level by default.",
 				EnvVars: []string{"TUNNEL_MANAGEMENT_FILTER_LEVEL"},
 				Value:   "debug",
+			},
+			&cli.Float64Flag{
+				Name:    "sample",
+				Usage:   "Sample log events by percentage (0.0 .. 1.0). No sampling by default.",
+				EnvVars: []string{"TUNNEL_MANAGEMENT_FILTER_SAMPLE"},
+				Value:   1.0,
 			},
 			&cli.StringFlag{
 				Name:    "token",
 				Usage:   "Access token for a specific tunnel",
 				Value:   "",
 				EnvVars: []string{"TUNNEL_MANAGEMENT_TOKEN"},
+			},
+			&cli.StringFlag{
+				Name:    "output",
+				Usage:   "Output format for the logs (default, json)",
+				Value:   "default",
+				EnvVars: []string{"TUNNEL_MANAGEMENT_OUTPUT"},
 			},
 			&cli.StringFlag{
 				Name:    "management-hostname",
@@ -87,6 +131,7 @@ func Command() *cli.Command {
 				Value:   credentials.FindDefaultOriginCertPath(),
 			},
 		},
+		Subcommands: subcommands,
 	}
 }
 
@@ -139,9 +184,11 @@ func createLogger(c *cli.Context) *zerolog.Logger {
 func parseFilters(c *cli.Context) (*management.StreamingFilters, error) {
 	var level *management.LogLevel
 	var events []management.LogEventType
+	var sample float64
 
 	argLevel := c.String("level")
 	argEvents := c.StringSlice("event")
+	argSample := c.Float64("sample")
 
 	if argLevel != "" {
 		l, ok := management.ParseLogLevel(argLevel)
@@ -159,14 +206,20 @@ func parseFilters(c *cli.Context) (*management.StreamingFilters, error) {
 		events = append(events, t)
 	}
 
-	if level == nil && len(events) == 0 {
+	if argSample <= 0.0 || argSample > 1.0 {
+		return nil, fmt.Errorf("invalid --sample value provided, please make sure it is in the range (0.0 .. 1.0)")
+	}
+	sample = argSample
+
+	if level == nil && len(events) == 0 && argSample != 1.0 {
 		// When no filters are provided, do not return a StreamingFilters struct
 		return nil, nil
 	}
 
 	return &management.StreamingFilters{
-		Level:  level,
-		Events: events,
+		Level:    level,
+		Events:   events,
+		Sampling: sample,
 	}, nil
 }
 
@@ -223,6 +276,24 @@ func buildURL(c *cli.Context, log *zerolog.Logger) (url.URL, error) {
 	return url.URL{Scheme: "wss", Host: managementHostname, Path: "/logs", RawQuery: query.Encode()}, nil
 }
 
+func printLine(log *management.Log, logger *zerolog.Logger) {
+	fields, err := json.Marshal(log.Fields)
+	if err != nil {
+		fields = []byte("unable to parse fields")
+		logger.Debug().Msgf("unable to parse fields from event %+v", log)
+	}
+	fmt.Printf("%s %s %s %s %s\n", log.Time, log.Level, log.Event, log.Message, fields)
+}
+
+func printJSON(log *management.Log, logger *zerolog.Logger) {
+	output, err := json.Marshal(log)
+	if err != nil {
+		logger.Debug().Msgf("unable to parse event to json %+v", log)
+	} else {
+		fmt.Println(string(output))
+	}
+}
+
 // Run implements a foreground runner
 func Run(c *cli.Context) error {
 	log := createLogger(c)
@@ -230,6 +301,16 @@ func Run(c *cli.Context) error {
 	signals := make(chan os.Signal, 10)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signals)
+
+	output := "default"
+	switch c.String("output") {
+	case "default", "":
+		output = "default"
+	case "json":
+		output = "json"
+	default:
+		log.Err(errors.New("invalid --output value provided, please make sure it is one of: default, json")).Send()
+	}
 
 	filters, err := parseFilters(c)
 	if err != nil {
@@ -311,12 +392,11 @@ func Run(c *cli.Context) error {
 					}
 					// Output all the logs received to stdout
 					for _, l := range logs.Logs {
-						fields, err := json.Marshal(l.Fields)
-						if err != nil {
-							fields = []byte("unable to parse fields")
-							log.Debug().Msgf("unable to parse fields from event %+v", l)
+						if output == "json" {
+							printJSON(l, log)
+						} else {
+							printLine(l, log)
 						}
-						fmt.Printf("%s %s %s %s %s\n", l.Time, l.Level, l.Event, l.Message, fields)
 					}
 				case management.UnknownServerEventType:
 					fallthrough
