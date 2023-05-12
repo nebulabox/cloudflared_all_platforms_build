@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -x
-VERSION="2023.4.1"
+VERSION="2023.5.0"
 DATE=$(date -u '+%Y-%m-%d-%H%M UTC')
 VERSION_FLAGS="-X \"main.Version=${VERSION}\" -X \"main.BuildTime=${DATE}\""
 NAME=cloudflared 
