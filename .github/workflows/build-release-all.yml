@@ -8,12 +8,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-linux:
+  build:
     runs-on: ubuntu-latest
     env:
       RUST_BACKTRACE: full
     steps:
       - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version: 'stable'
 
       - name: Install Go
         run: |
@@ -31,6 +34,7 @@ jobs:
         timeout-minutes: 180
         run: |
           pwd
+          go version
           VERSION="${{ steps.tag.outputs.result }}"
           set -x
           DATE=$(date -u '+%Y-%m-%d-%H%M UTC')
