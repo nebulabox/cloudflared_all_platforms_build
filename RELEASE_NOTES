@@ -1,3 +1,36 @@
+2023.7.1
+- 2023-07-13 TUN-7582: Correct changelog wording for --management-diagnostics
+- 2023-07-12 TUN-7575: Add option to disable PTMU discovery over QUIC
+
+2023.7.0
+- 2023-07-06 TUN-7558: Flush on Writes for StreamBasedOriginProxy
+- 2023-07-05 TUN-7553: Add flag to enable management diagnostic services
+- 2023-07-05 TUN-7564: Support cf-trace-id for cloudflared access
+- 2023-07-05 TUN-7477: Decrement UDP sessions on shutdown
+- 2023-07-03 TUN-7545: Add support for full bidirectionally streaming with close signal propagation
+- 2023-06-30 TUN-7549: Add metrics route to management service
+- 2023-06-30 TUN-7551: Complete removal of raven-go to sentry-go
+- 2023-06-30 TUN-7550: Add pprof endpoint to management service
+- 2023-06-29 TUN-7543: Add --debug-stream flag to cloudflared access ssh
+- 2023-06-26 TUN-6011: Remove docker networks from ICMP Proxy test
+- 2023-06-20 AUTH-5328 Pass cloudflared_token_check param when running cloudflared access login
+
+2023.6.1
+- 2023-06-19 TUN-7480: Added a timeout for unregisterUDP.
+- 2023-06-16 TUN-7477: Add UDP/TCP session metrics
+- 2023-06-14 TUN-7468: Increase the limit of incoming streams
+
+2023.6.0
+- 2023-06-15 TUN-7471: Fixes cloudflared not closing the quic stream on unregister UDP session
+- 2023-06-09 TUN-7463: Add default ingress rule if no ingress rules are provided when updating the configuration
+- 2023-05-31 TUN-7447: Add a cover build to report code coverage
+
+2023.5.1
+- 2023-05-16 TUN-7424: Add CORS headers to host_details responses
+- 2023-05-11 TUN-7421: Add *.cloudflare.com to permitted Origins for management WebSocket requests
+- 2023-05-05 TUN-7404: Default configuration version set to -1
+- 2023-05-05 TUN-7227: Migrate to devincarr/quic-go
+
 2023.5.0
 - 2023-04-27 TUN-7398: Add support for quic safe stream to set deadline
 - 2023-04-26 TUN-7394: Retry StartFirstTunnel on quic.ApplicationErrors

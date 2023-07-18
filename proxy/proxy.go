@@ -136,8 +136,11 @@ func (p *Proxy) ProxyHTTP(
 		if err != nil {
 			return err
 		}
-
-		rws := connection.NewHTTPResponseReadWriterAcker(w, req)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return fmt.Errorf("response writer is not a flusher")
+		}
+		rws := connection.NewHTTPResponseReadWriterAcker(w, flusher, req)
 		if err := p.proxyStream(tr.ToTracedContext(), rws, dest, originProxy); err != nil {
 			rule, srv := ruleField(p.ingressRules, ruleNum)
 			p.logRequestError(err, cfRay, "", rule, srv)
@@ -158,8 +161,8 @@ func (p *Proxy) ProxyTCP(
 	rwa connection.ReadWriteAcker,
 	req *connection.TCPRequest,
 ) error {
-	incrementRequests()
-	defer decrementConcurrentRequests()
+	incrementTCPRequests()
+	defer decrementTCPConcurrentRequests()
 
 	if p.warpRouting == nil {
 		err := errors.New(`cloudflared received a request from WARP client, but your configuration has disabled ingress from WARP clients. To enable this, set "warp-routing:\n\t enabled: true" in your config.yaml`)

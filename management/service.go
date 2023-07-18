@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"nhooyr.io/websocket"
 )
@@ -28,6 +31,17 @@ const (
 	reasonIdleLimitExceeded                      = "session was idle for too long"
 )
 
+var (
+	// CORS middleware required to allow dash to access management.argotunnel.com requests
+	corsHandler = cors.Handler(cors.Options{
+		// Allows for any subdomain of cloudflare.com
+		AllowedOrigins: []string{"https://*.cloudflare.com"},
+		// Required to present cookies or other authentication across origin boundries
+		AllowCredentials: true,
+		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	})
+)
+
 type ManagementService struct {
 	// The management tunnel hostname
 	Hostname string
@@ -36,6 +50,9 @@ type ManagementService struct {
 	serviceIP string
 	clientID  uuid.UUID
 	label     string
+
+	// Additional Handlers
+	metricsHandler http.Handler
 
 	log    *zerolog.Logger
 	router chi.Router
@@ -48,6 +65,7 @@ type ManagementService struct {
 }
 
 func New(managementHostname string,
+	enableDiagServices bool,
 	serviceIP string,
 	clientID uuid.UUID,
 	label string,
@@ -55,19 +73,31 @@ func New(managementHostname string,
 	logger LoggerListener,
 ) *ManagementService {
 	s := &ManagementService{
-		Hostname:  managementHostname,
-		log:       log,
-		logger:    logger,
-		serviceIP: serviceIP,
-		clientID:  clientID,
-		label:     label,
+		Hostname:       managementHostname,
+		log:            log,
+		logger:         logger,
+		serviceIP:      serviceIP,
+		clientID:       clientID,
+		label:          label,
+		metricsHandler: promhttp.Handler(),
 	}
 	r := chi.NewRouter()
 	r.Use(ValidateAccessTokenQueryMiddleware)
-	r.Get("/ping", ping)
-	r.Head("/ping", ping)
+
+	// Default management services
+	r.With(corsHandler).Get("/ping", ping)
+	r.With(corsHandler).Head("/ping", ping)
 	r.Get("/logs", s.logs)
-	r.Get("/host_details", s.getHostDetails)
+	r.With(corsHandler).Get("/host_details", s.getHostDetails)
+
+	// Diagnostic management services
+	if enableDiagServices {
+		// Prometheus endpoint
+		r.With(corsHandler).Get("/metrics", s.metricsHandler.ServeHTTP)
+		// Supports only heap and goroutine
+		r.With(corsHandler).Get("/debug/pprof/{profile:heap|goroutine}", pprof.Index)
+	}
+
 	s.router = r
 	return s
 }
@@ -216,7 +246,11 @@ func (m *ManagementService) parseFilters(c *websocket.Conn, event *ClientEvent, 
 
 // Management Streaming Logs accept handler
 func (m *ManagementService) logs(w http.ResponseWriter, r *http.Request) {
-	c, err := websocket.Accept(w, r, nil)
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: []string{
+			"*.cloudflare.com",
+		},
+	})
 	if err != nil {
 		m.log.Debug().Msgf("management handshake: %s", err.Error())
 		return

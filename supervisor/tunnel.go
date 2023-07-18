@@ -68,6 +68,10 @@ type TunnelConfig struct {
 	ProtocolSelector connection.ProtocolSelector
 	EdgeTLSConfigs   map[connection.Protocol]*tls.Config
 	PacketConfig     *ingress.GlobalRouterConfig
+
+	UDPUnregisterSessionTimeout time.Duration
+
+	DisableQUICPathMTUDiscovery bool
 }
 
 func (c *TunnelConfig) registrationOptions(connectionID uint8, OriginLocalIP string, uuid uuid.UUID) *tunnelpogs.RegistrationOptions {
@@ -594,14 +598,15 @@ func (e *EdgeTunnelServer) serveQUIC(
 	}
 
 	quicConfig := &quic.Config{
-		HandshakeIdleTimeout:  quicpogs.HandshakeIdleTimeout,
-		MaxIdleTimeout:        quicpogs.MaxIdleTimeout,
-		KeepAlivePeriod:       quicpogs.MaxIdlePingPeriod,
-		MaxIncomingStreams:    connection.MaxConcurrentStreams,
-		MaxIncomingUniStreams: connection.MaxConcurrentStreams,
-		EnableDatagrams:       true,
-		MaxDatagramFrameSize:  quicpogs.MaxDatagramFrameSize,
-		Tracer:                quicpogs.NewClientTracer(connLogger.Logger(), connIndex),
+		HandshakeIdleTimeout:    quicpogs.HandshakeIdleTimeout,
+		MaxIdleTimeout:          quicpogs.MaxIdleTimeout,
+		KeepAlivePeriod:         quicpogs.MaxIdlePingPeriod,
+		MaxIncomingStreams:      quicpogs.MaxIncomingStreams,
+		MaxIncomingUniStreams:   quicpogs.MaxIncomingStreams,
+		EnableDatagrams:         true,
+		MaxDatagramFrameSize:    quicpogs.MaxDatagramFrameSize,
+		Tracer:                  quicpogs.NewClientTracer(connLogger.Logger(), connIndex),
+		DisablePathMTUDiscovery: e.config.DisableQUICPathMTUDiscovery,
 	}
 
 	quicConn, err := connection.NewQUICConnection(
@@ -615,7 +620,9 @@ func (e *EdgeTunnelServer) serveQUIC(
 		connOptions,
 		controlStreamHandler,
 		connLogger.Logger(),
-		e.config.PacketConfig)
+		e.config.PacketConfig,
+		e.config.UDPUnregisterSessionTimeout,
+	)
 	if err != nil {
 		if e.config.NeedPQ {
 			handlePQTunnelError(err, e.config)
