@@ -17,10 +17,6 @@ jobs:
       - uses: actions/setup-go@v4
         with:
           go-version: 'stable'
-
-      - name: Install Go
-        run: |
-          apt install go
       
       - name: Extract tag name
         id: tag
