@@ -15,6 +15,12 @@ export TARGET_OS=linux
 for arch in ${linuxArchs[@]}; do
     unset TARGET_ARM
     export TARGET_ARCH=$arch
+
+    ## Support for arm platforms without hardware FPU enabled
+    if [[ $arch == arm ]] ; then
+        export TARGET_ARCH=arm
+        export TARGET_ARM=5
+    fi
     
     ## Support for armhf builds 
     if [[ $arch == armhf ]] ; then
