@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 set -x
-VERSION="2024.1.2"
+VERSION="2025.10.17"
 DATE=$(date -u '+%Y-%m-%d-%H%M UTC')
 VERSION_FLAGS="-X \"main.Version=${VERSION}\" -X \"main.BuildTime=${DATE}\""
 NAME=cloudflared 
@@ -37,6 +37,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=386 go build                     -mod=vendor -
 CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build                   -mod=vendor -ldflags="${VERSION_FLAGS} -w -s" -o release/${NAME}_windows_arm64.exe ${SRC}                 
 
 pushd release
+upx *
 for entry in *
 do
   echo "Packing : ${entry%.*}.tar.xz"
