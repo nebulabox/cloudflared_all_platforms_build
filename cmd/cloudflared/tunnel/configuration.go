@@ -10,24 +10,27 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
 	"github.com/urfave/cli/v2/altsrc"
 	"golang.org/x/term"
 
+	"github.com/cloudflare/cloudflared/client"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	"github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
 	"github.com/cloudflare/cloudflared/edgediscovery/allregions"
 	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/ingress/origins"
 	"github.com/cloudflare/cloudflared/orchestration"
 	"github.com/cloudflare/cloudflared/supervisor"
 	"github.com/cloudflare/cloudflared/tlsconfig"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
 const (
@@ -36,23 +39,23 @@ const (
 )
 
 var (
-	developerPortal = "https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup"
-	serviceUrl      = developerPortal + "/tunnel-guide/local/as-a-service/"
-	argumentsUrl    = developerPortal + "/tunnel-guide/local/local-management/arguments/"
-
 	secretFlags = [2]*altsrc.StringFlag{credentialsContentsFlag, tunnelTokenFlag}
 
-	configFlags = []string{"autoupdate-freq", "no-autoupdate", "retries", "protocol", "loglevel", "transport-loglevel", "origincert", "metrics", "metrics-update-freq", "edge-ip-version", "edge-bind-address"}
-)
-
-func generateRandomClientID(log *zerolog.Logger) (string, error) {
-	u, err := uuid.NewRandom()
-	if err != nil {
-		log.Error().Msgf("couldn't create UUID for client ID %s", err)
-		return "", err
+	configFlags = []string{
+		flags.AutoUpdateFreq,
+		flags.NoAutoUpdate,
+		flags.Retries,
+		flags.Protocol,
+		flags.LogLevel,
+		flags.TransportLogLevel,
+		flags.OriginCert,
+		flags.Metrics,
+		flags.MetricsUpdateFreq,
+		flags.EdgeIpVersion,
+		flags.EdgeBindAddress,
+		flags.MaxActiveFlows,
 	}
-	return u.String(), nil
-}
+)
 
 func logClientOptions(c *cli.Context, log *zerolog.Logger) {
 	flags := make(map[string]interface{})
@@ -108,9 +111,9 @@ func isSecretEnvVar(key string) bool {
 	return false
 }
 
-func dnsProxyStandAlone(c *cli.Context, namedTunnel *connection.NamedTunnelProperties) bool {
-	return c.IsSet("proxy-dns") &&
-		!(c.IsSet("name") || // adhoc-named tunnel
+func dnsProxyStandAlone(c *cli.Context, namedTunnel *connection.TunnelProperties) bool {
+	return c.IsSet(flags.ProxyDns) &&
+		!(c.IsSet(flags.Name) || // adhoc-named tunnel
 			c.IsSet(ingress.HelloWorldFlag) || // quick or named tunnel
 			namedTunnel != nil) // named tunnel
 }
@@ -121,64 +124,46 @@ func prepareTunnelConfig(
 	info *cliutil.BuildInfo,
 	log, logTransport *zerolog.Logger,
 	observer *connection.Observer,
-	namedTunnel *connection.NamedTunnelProperties,
+	namedTunnel *connection.TunnelProperties,
 ) (*supervisor.TunnelConfig, *orchestration.Config, error) {
-	clientID, err := uuid.NewRandom()
+	transportProtocol := c.String(flags.Protocol)
+	isPostQuantumEnforced := c.Bool(flags.PostQuantum)
+	featureSelector, err := features.NewFeatureSelector(ctx, namedTunnel.Credentials.AccountTag, c.StringSlice(flags.Features), isPostQuantumEnforced, log)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "can't generate connector UUID")
+		return nil, nil, errors.Wrap(err, "Failed to create feature selector")
 	}
-	log.Info().Msgf("Generated Connector ID: %s", clientID)
-	tags, err := NewTagSliceFromCLI(c.StringSlice("tag"))
+
+	clientConfig, err := client.NewConfig(info.Version(), info.OSArch(), featureSelector)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	log.Info().Msgf("Generated Connector ID: %s", clientConfig.ConnectorID)
+
+	tags, err := NewTagSliceFromCLI(c.StringSlice(flags.Tag))
 	if err != nil {
 		log.Err(err).Msg("Tag parse failure")
 		return nil, nil, errors.Wrap(err, "Tag parse failure")
 	}
-	tags = append(tags, tunnelpogs.Tag{Name: "ID", Value: clientID.String()})
+	tags = append(tags, pogs.Tag{Name: "ID", Value: clientConfig.ConnectorID.String()})
 
-	transportProtocol := c.String("protocol")
-
-	clientFeatures := features.Dedup(append(c.StringSlice("features"), features.DefaultFeatures...))
-
-	staticFeatures := features.StaticFeatures{}
-	if c.Bool("post-quantum") {
-		if FipsEnabled {
-			return nil, nil, fmt.Errorf("post-quantum not supported in FIPS mode")
-		}
-		pqMode := features.PostQuantumStrict
-		staticFeatures.PostQuantumMode = &pqMode
-	}
-	featureSelector, err := features.NewFeatureSelector(ctx, namedTunnel.Credentials.AccountTag, staticFeatures, log)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "Failed to create feature selector")
-	}
-	pqMode := featureSelector.PostQuantumMode()
+	clientFeatures := featureSelector.Snapshot()
+	pqMode := clientFeatures.PostQuantum
 	if pqMode == features.PostQuantumStrict {
 		// Error if the user tries to force a non-quic transport protocol
 		if transportProtocol != connection.AutoSelectFlag && transportProtocol != connection.QUIC.String() {
 			return nil, nil, fmt.Errorf("post-quantum is only supported with the quic transport")
 		}
 		transportProtocol = connection.QUIC.String()
-		clientFeatures = append(clientFeatures, features.FeaturePostQuantum)
-
-		log.Info().Msgf(
-			"Using hybrid post-quantum key agreement %s",
-			supervisor.PQKexName,
-		)
 	}
 
-	namedTunnel.Client = tunnelpogs.ClientInfo{
-		ClientID: clientID[:],
-		Features: clientFeatures,
-		Version:  info.Version(),
-		Arch:     info.OSArch(),
-	}
 	cfg := config.GetConfiguration()
 	ingressRules, err := ingress.ParseIngressFromConfigAndCLI(cfg, c, log)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	protocolSelector, err := connection.NewProtocolSelector(transportProtocol, namedTunnel.Credentials.AccountTag, c.IsSet(TunnelTokenFlag), c.Bool("post-quantum"), edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
+	protocolSelector, err := connection.NewProtocolSelector(transportProtocol, namedTunnel.Credentials.AccountTag, c.IsSet(TunnelTokenFlag), isPostQuantumEnforced, edgediscovery.ProtocolPercentage, connection.ResolveTTL, log)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -204,11 +189,11 @@ func prepareTunnelConfig(
 	if err != nil {
 		return nil, nil, err
 	}
-	edgeIPVersion, err := parseConfigIPVersion(c.String("edge-ip-version"))
+	edgeIPVersion, err := parseConfigIPVersion(c.String(flags.EdgeIpVersion))
 	if err != nil {
 		return nil, nil, err
 	}
-	edgeBindAddr, err := parseConfigBindAddress(c.String("edge-bind-address"))
+	edgeBindAddr, err := parseConfigBindAddress(c.String(flags.EdgeBindAddress))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -221,46 +206,82 @@ func prepareTunnelConfig(
 		log.Warn().Str("edgeIPVersion", edgeIPVersion.String()).Err(err).Msg("Overriding edge-ip-version")
 	}
 
+	region := c.String(flags.Region)
+	endpoint := namedTunnel.Credentials.Endpoint
+	var resolvedRegion string
+	// set resolvedRegion to either the region passed as argument
+	// or to the endpoint in the credentials.
+	// Region and endpoint are interchangeable
+	if region != "" && endpoint != "" {
+		return nil, nil, fmt.Errorf("region provided with a token that has an endpoint")
+	} else if region != "" {
+		resolvedRegion = region
+	} else if endpoint != "" {
+		resolvedRegion = endpoint
+	}
+
+	warpRoutingConfig := ingress.NewWarpRoutingConfig(&cfg.WarpRouting)
+
+	// Setup origin dialer service and virtual services
+	originDialerService := ingress.NewOriginDialer(ingress.OriginConfig{
+		DefaultDialer:   ingress.NewDialer(warpRoutingConfig),
+		TCPWriteTimeout: c.Duration(flags.WriteStreamTimeout),
+	}, log)
+
+	// Setup DNS Resolver Service
+	originMetrics := origins.NewMetrics(prometheus.DefaultRegisterer)
+	dnsResolverAddrs := c.StringSlice(flags.VirtualDNSServiceResolverAddresses)
+	dnsService := origins.NewDNSResolverService(origins.NewDNSDialer(), log, originMetrics)
+	if len(dnsResolverAddrs) > 0 {
+		addrs, err := parseResolverAddrPorts(dnsResolverAddrs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid %s provided: %w", flags.VirtualDNSServiceResolverAddresses, err)
+		}
+		dnsService = origins.NewStaticDNSResolverService(addrs, origins.NewDNSDialer(), log, originMetrics)
+	}
+	originDialerService.AddReservedService(dnsService, []netip.AddrPort{origins.VirtualDNSServiceAddr})
+
 	tunnelConfig := &supervisor.TunnelConfig{
+		ClientConfig:    clientConfig,
 		GracePeriod:     gracePeriod,
-		ReplaceExisting: c.Bool("force"),
-		OSArch:          info.OSArch(),
-		ClientID:        clientID.String(),
-		EdgeAddrs:       c.StringSlice("edge"),
-		Region:          c.String("region"),
+		EdgeAddrs:       c.StringSlice(flags.Edge),
+		Region:          resolvedRegion,
 		EdgeIPVersion:   edgeIPVersion,
 		EdgeBindAddr:    edgeBindAddr,
-		HAConnections:   c.Int(haConnectionsFlag),
-		IsAutoupdated:   c.Bool("is-autoupdated"),
-		LBPool:          c.String("lb-pool"),
+		HAConnections:   c.Int(flags.HaConnections),
+		IsAutoupdated:   c.Bool(flags.IsAutoUpdated),
+		LBPool:          c.String(flags.LBPool),
 		Tags:            tags,
 		Log:             log,
 		LogTransport:    logTransport,
 		Observer:        observer,
 		ReportedVersion: info.Version(),
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
-		Retries:                     uint(c.Int("retries")),
-		RunFromTerminal:             isRunningFromTerminal(),
-		NamedTunnel:                 namedTunnel,
-		ProtocolSelector:            protocolSelector,
-		EdgeTLSConfigs:              edgeTLSConfigs,
-		FeatureSelector:             featureSelector,
-		MaxEdgeAddrRetries:          uint8(c.Int("max-edge-addr-retries")),
-		UDPUnregisterSessionTimeout: c.Duration(udpUnregisterSessionTimeoutFlag),
-		WriteStreamTimeout:          c.Duration(writeStreamTimeout),
-		DisableQUICPathMTUDiscovery: c.Bool(quicDisablePathMTUDiscovery),
+		Retries:                             uint(c.Int(flags.Retries)), // nolint: gosec
+		RunFromTerminal:                     isRunningFromTerminal(),
+		NamedTunnel:                         namedTunnel,
+		ProtocolSelector:                    protocolSelector,
+		EdgeTLSConfigs:                      edgeTLSConfigs,
+		MaxEdgeAddrRetries:                  uint8(c.Int(flags.MaxEdgeAddrRetries)), // nolint: gosec
+		RPCTimeout:                          c.Duration(flags.RpcTimeout),
+		WriteStreamTimeout:                  c.Duration(flags.WriteStreamTimeout),
+		DisableQUICPathMTUDiscovery:         c.Bool(flags.QuicDisablePathMTUDiscovery),
+		QUICConnectionLevelFlowControlLimit: c.Uint64(flags.QuicConnLevelFlowControlLimit),
+		QUICStreamLevelFlowControlLimit:     c.Uint64(flags.QuicStreamLevelFlowControlLimit),
+		OriginDNSService:                    dnsService,
+		OriginDialerService:                 originDialerService,
 	}
-	packetConfig, err := newPacketConfig(c, log)
+	icmpRouter, err := newICMPRouter(c, log)
 	if err != nil {
 		log.Warn().Err(err).Msg("ICMP proxy feature is disabled")
 	} else {
-		tunnelConfig.PacketConfig = packetConfig
+		tunnelConfig.ICMPRouterServer = icmpRouter
 	}
 	orchestratorConfig := &orchestration.Config{
-		Ingress:            &ingressRules,
-		WarpRouting:        ingress.NewWarpRoutingConfig(&cfg.WarpRouting),
-		ConfigurationFlags: parseConfigFlags(c),
-		WriteTimeout:       c.Duration(writeStreamTimeout),
+		Ingress:             &ingressRules,
+		WarpRouting:         warpRoutingConfig,
+		OriginDialerService: originDialerService,
+		ConfigurationFlags:  parseConfigFlags(c),
 	}
 	return tunnelConfig, orchestratorConfig, nil
 }
@@ -278,9 +299,9 @@ func parseConfigFlags(c *cli.Context) map[string]string {
 }
 
 func gracePeriod(c *cli.Context) (time.Duration, error) {
-	period := c.Duration("grace-period")
+	period := c.Duration(flags.GracePeriod)
 	if period > connection.MaxGracePeriod {
-		return time.Duration(0), fmt.Errorf("grace-period must be equal or less than %v", connection.MaxGracePeriod)
+		return time.Duration(0), fmt.Errorf("%s must be equal or less than %v", flags.GracePeriod, connection.MaxGracePeriod)
 	}
 	return period, nil
 }
@@ -349,33 +370,39 @@ func adjustIPVersionByBindAddress(ipVersion allregions.ConfigIPVersion, ip net.I
 	}
 }
 
-func newPacketConfig(c *cli.Context, logger *zerolog.Logger) (*ingress.GlobalRouterConfig, error) {
-	ipv4Src, err := determineICMPv4Src(c.String("icmpv4-src"), logger)
+func newICMPRouter(c *cli.Context, logger *zerolog.Logger) (ingress.ICMPRouterServer, error) {
+	ipv4Src, ipv6Src, err := determineICMPSources(c, logger)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to determine IPv4 source address for ICMP proxy")
+		return nil, err
 	}
+
+	icmpRouter, err := ingress.NewICMPRouter(ipv4Src, ipv6Src, logger, icmpFunnelTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return icmpRouter, nil
+}
+
+func determineICMPSources(c *cli.Context, logger *zerolog.Logger) (netip.Addr, netip.Addr, error) {
+	ipv4Src, err := determineICMPv4Src(c.String(flags.ICMPV4Src), logger)
+	if err != nil {
+		return netip.Addr{}, netip.Addr{}, errors.Wrap(err, "failed to determine IPv4 source address for ICMP proxy")
+	}
+
 	logger.Info().Msgf("ICMP proxy will use %s as source for IPv4", ipv4Src)
 
-	ipv6Src, zone, err := determineICMPv6Src(c.String("icmpv6-src"), logger, ipv4Src)
+	ipv6Src, zone, err := determineICMPv6Src(c.String(flags.ICMPV6Src), logger, ipv4Src)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to determine IPv6 source address for ICMP proxy")
+		return netip.Addr{}, netip.Addr{}, errors.Wrap(err, "failed to determine IPv6 source address for ICMP proxy")
 	}
+
 	if zone != "" {
 		logger.Info().Msgf("ICMP proxy will use %s in zone %s as source for IPv6", ipv6Src, zone)
 	} else {
 		logger.Info().Msgf("ICMP proxy will use %s as source for IPv6", ipv6Src)
 	}
 
-	icmpRouter, err := ingress.NewICMPRouter(ipv4Src, ipv6Src, zone, logger, icmpFunnelTimeout)
-	if err != nil {
-		return nil, err
-	}
-	return &ingress.GlobalRouterConfig{
-		ICMPRouter: icmpRouter,
-		IPv4Src:    ipv4Src,
-		IPv6Src:    ipv6Src,
-		Zone:       zone,
-	}, nil
+	return ipv4Src, ipv6Src, nil
 }
 
 func determineICMPv4Src(userDefinedSrc string, logger *zerolog.Logger) (netip.Addr, error) {
@@ -405,13 +432,12 @@ type interfaceIP struct {
 
 func determineICMPv6Src(userDefinedSrc string, logger *zerolog.Logger, ipv4Src netip.Addr) (addr netip.Addr, zone string, err error) {
 	if userDefinedSrc != "" {
-		userDefinedIP, zone, _ := strings.Cut(userDefinedSrc, "%")
-		addr, err := netip.ParseAddr(userDefinedIP)
+		addr, err := netip.ParseAddr(userDefinedSrc)
 		if err != nil {
 			return netip.Addr{}, "", err
 		}
 		if addr.Is6() {
-			return addr, zone, nil
+			return addr, addr.Zone(), nil
 		}
 		return netip.Addr{}, "", fmt.Errorf("expect IPv6, but %s is IPv4", userDefinedSrc)
 	}
@@ -491,4 +517,20 @@ func findLocalAddr(dst net.IP, port int) (netip.Addr, error) {
 	}
 	localAddr := localAddrPort.Addr()
 	return localAddr, nil
+}
+
+func parseResolverAddrPorts(input []string) ([]netip.AddrPort, error) {
+	// We don't allow more than 10 resolvers to be provided statically for the resolver service.
+	if len(input) > 10 {
+		return nil, errors.New("too many addresses provided, max: 10")
+	}
+	addrs := make([]netip.AddrPort, 0, len(input))
+	for _, val := range input {
+		addr, err := netip.ParseAddrPort(val)
+		if err != nil {
+			return nil, err
+		}
+		addrs = append(addrs, addr)
+	}
+	return addrs, nil
 }

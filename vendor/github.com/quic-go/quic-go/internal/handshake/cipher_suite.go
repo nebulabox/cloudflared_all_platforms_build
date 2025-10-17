@@ -18,7 +18,7 @@ type cipherSuite struct {
 	ID     uint16
 	Hash   crypto.Hash
 	KeyLen int
-	AEAD   func(key, nonceMask []byte) cipher.AEAD
+	AEAD   func(key, nonceMask []byte) *xorNonceAEAD
 }
 
 func (s cipherSuite) IVLen() int { return aeadNonceLength }
@@ -36,7 +36,7 @@ func getCipherSuite(id uint16) *cipherSuite {
 	}
 }
 
-func aeadAESGCMTLS13(key, nonceMask []byte) cipher.AEAD {
+func aeadAESGCMTLS13(key, nonceMask []byte) *xorNonceAEAD {
 	if len(nonceMask) != aeadNonceLength {
 		panic("tls: internal error: wrong nonce length")
 	}
@@ -44,17 +44,18 @@ func aeadAESGCMTLS13(key, nonceMask []byte) cipher.AEAD {
 	if err != nil {
 		panic(err)
 	}
-	aead, err := cipher.NewGCM(aes)
+
+	aead, err := newAEAD(aes)
 	if err != nil {
 		panic(err)
 	}
 
-	ret := &xorNonceAEAD{aead: aead}
+	ret := &xorNonceAEAD{aead: aead, hasSeenNonceZero: false}
 	copy(ret.nonceMask[:], nonceMask)
 	return ret
 }
 
-func aeadChaCha20Poly1305(key, nonceMask []byte) cipher.AEAD {
+func aeadChaCha20Poly1305(key, nonceMask []byte) *xorNonceAEAD {
 	if len(nonceMask) != aeadNonceLength {
 		panic("tls: internal error: wrong nonce length")
 	}
@@ -71,8 +72,9 @@ func aeadChaCha20Poly1305(key, nonceMask []byte) cipher.AEAD {
 // xorNonceAEAD wraps an AEAD by XORing in a fixed pattern to the nonce
 // before each call.
 type xorNonceAEAD struct {
-	nonceMask [aeadNonceLength]byte
-	aead      cipher.AEAD
+	nonceMask        [aeadNonceLength]byte
+	aead             cipher.AEAD
+	hasSeenNonceZero bool // This value denotes if the aead field was used with a nonce = 0
 }
 
 func (f *xorNonceAEAD) NonceSize() int        { return 8 } // 64-bit sequence number
@@ -80,6 +82,10 @@ func (f *xorNonceAEAD) Overhead() int         { return f.aead.Overhead() }
 func (f *xorNonceAEAD) explicitNonceLen() int { return 0 }
 
 func (f *xorNonceAEAD) Seal(out, nonce, plaintext, additionalData []byte) []byte {
+	return f.seal(nonce, out, plaintext, additionalData)
+}
+
+func (f *xorNonceAEAD) doSeal(nonce, out, plaintext, additionalData []byte) []byte {
 	for i, b := range nonce {
 		f.nonceMask[4+i] ^= b
 	}

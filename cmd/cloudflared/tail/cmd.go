@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,14 +19,12 @@ import (
 	"nhooyr.io/websocket"
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/credentials"
-	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/management"
 )
 
-var (
-	buildInfo *cliutil.BuildInfo
-)
+var buildInfo *cliutil.BuildInfo
 
 func Init(bi *cliutil.BuildInfo) {
 	buildInfo = bi
@@ -52,11 +51,12 @@ func buildTailManagementTokenSubcommand() *cli.Command {
 
 func managementTokenCommand(c *cli.Context) error {
 	log := createLogger(c)
+
 	token, err := getManagementToken(c, log)
 	if err != nil {
 		return err
 	}
-	var tokenResponse = struct {
+	tokenResponse := struct {
 		Token string `json:"token"`
 	}{Token: token}
 
@@ -100,13 +100,7 @@ func buildTailCommand(subcommands []*cli.Command) *cli.Command {
 				EnvVars: []string{"TUNNEL_MANAGEMENT_TOKEN"},
 			},
 			&cli.StringFlag{
-				Name:    "output",
-				Usage:   "Output format for the logs (default, json)",
-				Value:   "default",
-				EnvVars: []string{"TUNNEL_MANAGEMENT_OUTPUT"},
-			},
-			&cli.StringFlag{
-				Name:    "management-hostname",
+				Name:    cfdflags.ManagementHostname,
 				Usage:   "Management hostname to signify incoming management requests",
 				EnvVars: []string{"TUNNEL_MANAGEMENT_HOSTNAME"},
 				Hidden:  true,
@@ -119,17 +113,18 @@ func buildTailCommand(subcommands []*cli.Command) *cli.Command {
 				Value:  "",
 			},
 			&cli.StringFlag{
-				Name:    logger.LogLevelFlag,
+				Name:    cfdflags.LogLevel,
 				Value:   "info",
 				Usage:   "Application logging level {debug, info, warn, error, fatal}",
 				EnvVars: []string{"TUNNEL_LOGLEVEL"},
 			},
 			&cli.StringFlag{
-				Name:    credentials.OriginCertFlag,
+				Name:    cfdflags.OriginCert,
 				Usage:   "Path to the certificate generated for your origin when you run cloudflared login.",
 				EnvVars: []string{"TUNNEL_ORIGIN_CERT"},
 				Value:   credentials.FindDefaultOriginCertPath(),
 			},
+			cliutil.FlagLogOutput,
 		},
 		Subcommands: subcommands,
 	}
@@ -169,22 +164,34 @@ func handleValidationError(resp *http.Response, log *zerolog.Logger) {
 // logger will be created to emit only against the os.Stderr as to not obstruct with normal output from
 // management requests
 func createLogger(c *cli.Context) *zerolog.Logger {
-	level, levelErr := zerolog.ParseLevel(c.String(logger.LogLevelFlag))
+	level, levelErr := zerolog.ParseLevel(c.String(cfdflags.LogLevel))
 	if levelErr != nil {
 		level = zerolog.InfoLevel
 	}
-	log := zerolog.New(zerolog.ConsoleWriter{
-		Out:        colorable.NewColorable(os.Stderr),
-		TimeFormat: time.RFC3339,
-	}).With().Timestamp().Logger().Level(level)
+	var writer io.Writer
+	switch c.String(cfdflags.LogFormatOutput) {
+	case cfdflags.LogFormatOutputValueJSON:
+		// zerolog by default outputs as JSON
+		writer = os.Stderr
+	case cfdflags.LogFormatOutputValueDefault:
+		// "default" and unset use the same logger output format
+		fallthrough
+	default:
+		writer = zerolog.ConsoleWriter{
+			Out:        colorable.NewColorable(os.Stderr),
+			TimeFormat: time.RFC3339,
+		}
+	}
+	log := zerolog.New(writer).With().Timestamp().Logger().Level(level)
 	return &log
 }
 
 // parseFilters will attempt to parse provided filters to send to with the EventStartStreaming
 func parseFilters(c *cli.Context) (*management.StreamingFilters, error) {
 	var level *management.LogLevel
-	var events []management.LogEventType
 	var sample float64
+
+	events := make([]management.LogEventType, 0)
 
 	argLevel := c.String("level")
 	argEvents := c.StringSlice("event")
@@ -225,12 +232,19 @@ func parseFilters(c *cli.Context) (*management.StreamingFilters, error) {
 
 // getManagementToken will make a call to the Cloudflare API to acquire a management token for the requested tunnel.
 func getManagementToken(c *cli.Context, log *zerolog.Logger) (string, error) {
-	userCreds, err := credentials.Read(c.String(credentials.OriginCertFlag), log)
+	userCreds, err := credentials.Read(c.String(cfdflags.OriginCert), log)
 	if err != nil {
 		return "", err
 	}
 
-	client, err := userCreds.Client(c.String("api-url"), buildInfo.UserAgent(), log)
+	var apiURL string
+	if userCreds.IsFEDEndpoint() {
+		apiURL = credentials.FedRampBaseApiURL
+	} else {
+		apiURL = c.String(cfdflags.ApiURL)
+	}
+
+	client, err := userCreds.Client(apiURL, buildInfo.UserAgent(), log)
 	if err != nil {
 		return "", err
 	}
@@ -255,7 +269,7 @@ func getManagementToken(c *cli.Context, log *zerolog.Logger) (string, error) {
 // buildURL will build the management url to contain the required query parameters to authenticate the request.
 func buildURL(c *cli.Context, log *zerolog.Logger) (url.URL, error) {
 	var err error
-	managementHostname := c.String("management-hostname")
+
 	token := c.String("token")
 	if token == "" {
 		token, err = getManagementToken(c, log)
@@ -263,6 +277,19 @@ func buildURL(c *cli.Context, log *zerolog.Logger) (url.URL, error) {
 			return url.URL{}, fmt.Errorf("unable to acquire management token for requested tunnel id: %w", err)
 		}
 	}
+
+	claims, err := management.ParseToken(token)
+	if err != nil {
+		return url.URL{}, fmt.Errorf("failed to determine if token is FED: %w", err)
+	}
+
+	var managementHostname string
+	if claims.IsFed() {
+		managementHostname = credentials.FedRampHostname
+	} else {
+		managementHostname = c.String(cfdflags.ManagementHostname)
+	}
+
 	query := url.Values{}
 	query.Add("access_token", token)
 	connector := c.String("connector-id")
@@ -331,6 +358,7 @@ func Run(c *cli.Context) error {
 		header["cf-trace-id"] = []string{trace}
 	}
 	ctx := c.Context
+	// nolint: bodyclose
 	conn, resp, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
 		HTTPHeader: header,
 	})

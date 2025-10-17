@@ -22,6 +22,7 @@ var (
 const (
 	defaultProxyAddress           = "127.0.0.1"
 	defaultKeepAliveConnections   = 100
+	defaultMaxActiveFlows         = 0 // unlimited
 	SSHServerFlag                 = "ssh-server"
 	Socks5Flag                    = "socks5"
 	ProxyConnectTimeoutFlag       = "proxy-connect-timeout"
@@ -32,6 +33,7 @@ const (
 	ProxyKeepAliveTimeoutFlag     = "proxy-keepalive-timeout"
 	HTTPHostHeaderFlag            = "http-host-header"
 	OriginServerNameFlag          = "origin-server-name"
+	MatchSNIToHostFlag            = "match-sni-to-host"
 	NoTLSVerifyFlag               = "no-tls-verify"
 	NoChunkedEncodingFlag         = "no-chunked-encoding"
 	ProxyAddressFlag              = "proxy-address"
@@ -45,16 +47,21 @@ const (
 
 type WarpRoutingConfig struct {
 	ConnectTimeout config.CustomDuration `yaml:"connectTimeout" json:"connectTimeout,omitempty"`
+	MaxActiveFlows uint64                `yaml:"maxActiveFlows" json:"MaxActiveFlows,omitempty"`
 	TCPKeepAlive   config.CustomDuration `yaml:"tcpKeepAlive" json:"tcpKeepAlive,omitempty"`
 }
 
 func NewWarpRoutingConfig(raw *config.WarpRoutingConfig) WarpRoutingConfig {
 	cfg := WarpRoutingConfig{
 		ConnectTimeout: defaultWarpRoutingConnectTimeout,
+		MaxActiveFlows: defaultMaxActiveFlows,
 		TCPKeepAlive:   defaultTCPKeepAlive,
 	}
 	if raw.ConnectTimeout != nil {
 		cfg.ConnectTimeout = *raw.ConnectTimeout
+	}
+	if raw.MaxActiveFlows != nil {
+		cfg.MaxActiveFlows = *raw.MaxActiveFlows
 	}
 	if raw.TCPKeepAlive != nil {
 		cfg.TCPKeepAlive = *raw.TCPKeepAlive
@@ -66,6 +73,9 @@ func (c *WarpRoutingConfig) RawConfig() config.WarpRoutingConfig {
 	raw := config.WarpRoutingConfig{}
 	if c.ConnectTimeout.Duration != defaultWarpRoutingConnectTimeout.Duration {
 		raw.ConnectTimeout = &c.ConnectTimeout
+	}
+	if c.MaxActiveFlows != defaultMaxActiveFlows {
+		raw.MaxActiveFlows = &c.MaxActiveFlows
 	}
 	if c.TCPKeepAlive.Duration != defaultTCPKeepAlive.Duration {
 		raw.TCPKeepAlive = &c.TCPKeepAlive
@@ -118,6 +128,7 @@ func originRequestFromSingleRule(c *cli.Context) OriginRequestConfig {
 	var keepAliveTimeout = defaultKeepAliveTimeout
 	var httpHostHeader string
 	var originServerName string
+	var matchSNItoHost bool
 	var caPool string
 	var noTLSVerify bool
 	var disableChunkedEncoding bool
@@ -150,6 +161,9 @@ func originRequestFromSingleRule(c *cli.Context) OriginRequestConfig {
 	if flag := OriginServerNameFlag; c.IsSet(flag) {
 		originServerName = c.String(flag)
 	}
+	if flag := MatchSNIToHostFlag; c.IsSet(flag) {
+		matchSNItoHost = c.Bool(flag)
+	}
 	if flag := tlsconfig.OriginCAPoolFlag; c.IsSet(flag) {
 		caPool = c.String(flag)
 	}
@@ -167,6 +181,7 @@ func originRequestFromSingleRule(c *cli.Context) OriginRequestConfig {
 	}
 	if flag := ProxyPortFlag; c.IsSet(flag) {
 		// Note TUN-3758 , we use Int because UInt is not supported with altsrc
+		// nolint: gosec
 		proxyPort = uint(c.Int(flag))
 	}
 	if flag := Http2OriginFlag; c.IsSet(flag) {
@@ -185,6 +200,7 @@ func originRequestFromSingleRule(c *cli.Context) OriginRequestConfig {
 		KeepAliveTimeout:       keepAliveTimeout,
 		HTTPHostHeader:         httpHostHeader,
 		OriginServerName:       originServerName,
+		MatchSNIToHost:         matchSNItoHost,
 		CAPool:                 caPool,
 		NoTLSVerify:            noTLSVerify,
 		DisableChunkedEncoding: disableChunkedEncoding,
@@ -228,6 +244,9 @@ func originRequestFromConfig(c config.OriginRequestConfig) OriginRequestConfig {
 	}
 	if c.OriginServerName != nil {
 		out.OriginServerName = *c.OriginServerName
+	}
+	if c.MatchSNIToHost != nil {
+		out.MatchSNIToHost = *c.MatchSNIToHost
 	}
 	if c.CAPool != nil {
 		out.CAPool = *c.CAPool
@@ -287,6 +306,8 @@ type OriginRequestConfig struct {
 	HTTPHostHeader string `yaml:"httpHostHeader" json:"httpHostHeader"`
 	// Hostname on the origin server certificate.
 	OriginServerName string `yaml:"originServerName" json:"originServerName"`
+	// Auto configure the Hostname on the origin server certificate.
+	MatchSNIToHost bool `yaml:"matchSNItoHost" json:"matchSNItoHost"`
 	// Path to the CA for the certificate of your origin.
 	// This option should be used only if your certificate is not signed by Cloudflare.
 	CAPool string `yaml:"caPool" json:"caPool"`
@@ -359,6 +380,12 @@ func (defaults *OriginRequestConfig) setHTTPHostHeader(overrides config.OriginRe
 func (defaults *OriginRequestConfig) setOriginServerName(overrides config.OriginRequestConfig) {
 	if val := overrides.OriginServerName; val != nil {
 		defaults.OriginServerName = *val
+	}
+}
+
+func (defaults *OriginRequestConfig) setMatchSNIToHost(overrides config.OriginRequestConfig) {
+	if val := overrides.MatchSNIToHost; val != nil {
+		defaults.MatchSNIToHost = *val
 	}
 }
 
@@ -447,6 +474,7 @@ func setConfig(defaults OriginRequestConfig, overrides config.OriginRequestConfi
 	cfg.setTCPKeepAlive(overrides)
 	cfg.setHTTPHostHeader(overrides)
 	cfg.setOriginServerName(overrides)
+	cfg.setMatchSNIToHost(overrides)
 	cfg.setCAPool(overrides)
 	cfg.setNoTLSVerify(overrides)
 	cfg.setDisableChunkedEncoding(overrides)
@@ -501,6 +529,7 @@ func ConvertToRawOriginConfig(c OriginRequestConfig) config.OriginRequestConfig 
 		KeepAliveTimeout:       keepAliveTimeout,
 		HTTPHostHeader:         emptyStringToNil(c.HTTPHostHeader),
 		OriginServerName:       emptyStringToNil(c.OriginServerName),
+		MatchSNIToHost:         defaultBoolToNil(c.MatchSNIToHost),
 		CAPool:                 emptyStringToNil(c.CAPool),
 		NoTLSVerify:            defaultBoolToNil(c.NoTLSVerify),
 		DisableChunkedEncoding: defaultBoolToNil(c.DisableChunkedEncoding),
@@ -532,7 +561,7 @@ func convertToRawIPRules(ipRules []ipaccess.Rule) []config.IngressIPRule {
 }
 
 func defaultBoolToNil(b bool) *bool {
-	if b == false {
+	if !b {
 		return nil
 	}
 

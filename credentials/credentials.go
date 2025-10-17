@@ -9,6 +9,9 @@ import (
 
 const (
 	logFieldOriginCertPath = "originCertPath"
+	FedEndpoint            = "fed"
+	FedRampBaseApiURL      = "https://api.fed.cloudflare.com/client/v4"
+	FedRampHostname        = "management.fed.argotunnel.com"
 )
 
 type User struct {
@@ -18,6 +21,10 @@ type User struct {
 
 func (c User) AccountID() string {
 	return c.cert.AccountID
+}
+
+func (c User) Endpoint() string {
+	return c.cert.Endpoint
 }
 
 func (c User) ZoneID() string {
@@ -30,6 +37,10 @@ func (c User) APIToken() string {
 
 func (c User) CertPath() string {
 	return c.certPath
+}
+
+func (c User) IsFEDEndpoint() bool {
+	return c.cert.Endpoint == FedEndpoint
 }
 
 // Client uses the user credentials to create a Cloudflare API client
@@ -45,7 +56,6 @@ func (c *User) Client(apiURL string, userAgent string, log *zerolog.Logger) (cfa
 		userAgent,
 		log,
 	)
-
 	if err != nil {
 		return nil, err
 	}

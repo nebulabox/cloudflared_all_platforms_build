@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 
@@ -31,7 +31,8 @@ const (
 )
 
 var (
-	userAgent = "DEV"
+	userAgent     = "DEV"
+	signatureAlgs = []jose.SignatureAlgorithm{jose.RS256}
 )
 
 type AppInfo struct {
@@ -52,7 +53,7 @@ type signalHandler struct {
 }
 
 type jwtPayload struct {
-	Aud   []string `json:"aud"`
+	Aud   []string `json:"-"`
 	Email string   `json:"email"`
 	Exp   int      `json:"exp"`
 	Iat   int      `json:"iat"`
@@ -65,6 +66,34 @@ type jwtPayload struct {
 type transferServiceResponse struct {
 	AppToken string `json:"app_token"`
 	OrgToken string `json:"org_token"`
+}
+
+func (p *jwtPayload) UnmarshalJSON(data []byte) error {
+	type Alias jwtPayload
+	if err := json.Unmarshal(data, (*Alias)(p)); err != nil {
+		return err
+	}
+	var audParser struct {
+		Aud any `json:"aud"`
+	}
+	if err := json.Unmarshal(data, &audParser); err != nil {
+		return err
+	}
+	switch aud := audParser.Aud.(type) {
+	case string:
+		p.Aud = []string{aud}
+	case []any:
+		for _, a := range aud {
+			s, ok := a.(string)
+			if !ok {
+				return errors.New("aud array contains non-string elements")
+			}
+			p.Aud = append(p.Aud, s)
+		}
+	default:
+		return errors.New("aud field is not a string or an array of strings")
+	}
+	return nil
 }
 
 func (p jwtPayload) isExpired() bool {
@@ -93,9 +122,10 @@ func errDeleteTokenFailed(lockFilePath string) error {
 // newLock will get a new file lock
 func newLock(path string) *lock {
 	lockPath := path + ".lock"
+	backoff := retry.NewBackoff(uint(7), retry.DefaultBaseTime, false)
 	return &lock{
 		lockFilePath: lockPath,
-		backoff:      &retry.BackoffHandler{MaxRetries: 7},
+		backoff:      &backoff,
 		sigHandler: &signalHandler{
 			signals: []os.Signal{syscall.SIGINT, syscall.SIGTERM},
 		},
@@ -155,18 +185,18 @@ func Init(version string) {
 
 // FetchTokenWithRedirect will either load a stored token or generate a new one
 // it appends the full url as the redirect URL to the access cli request if opening the browser
-func FetchTokenWithRedirect(appURL *url.URL, appInfo *AppInfo, log *zerolog.Logger) (string, error) {
-	return getToken(appURL, appInfo, false, log)
+func FetchTokenWithRedirect(appURL *url.URL, appInfo *AppInfo, autoClose bool, isFedramp bool, log *zerolog.Logger) (string, error) {
+	return getToken(appURL, appInfo, false, autoClose, isFedramp, log)
 }
 
 // FetchToken will either load a stored token or generate a new one
 // it appends the host of the appURL as the redirect URL to the access cli request if opening the browser
-func FetchToken(appURL *url.URL, appInfo *AppInfo, log *zerolog.Logger) (string, error) {
-	return getToken(appURL, appInfo, true, log)
+func FetchToken(appURL *url.URL, appInfo *AppInfo, autoClose bool, isFedramp bool, log *zerolog.Logger) (string, error) {
+	return getToken(appURL, appInfo, true, autoClose, isFedramp, log)
 }
 
 // getToken will either load a stored token or generate a new one
-func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.Logger) (string, error) {
+func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, autoClose bool, isFedramp bool, log *zerolog.Logger) (string, error) {
 	if token, err := GetAppTokenIfExists(appInfo); token != "" && err == nil {
 		return token, nil
 	}
@@ -180,7 +210,9 @@ func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.
 	if err = fileLockAppToken.Acquire(); err != nil {
 		return "", errors.Wrap(err, "failed to acquire app token lock")
 	}
-	defer fileLockAppToken.Release()
+	defer func() {
+		_ = fileLockAppToken.Release()
+	}()
 
 	// check to see if another process has gotten a token while we waited for the lock
 	if token, err := GetAppTokenIfExists(appInfo); token != "" && err == nil {
@@ -200,7 +232,9 @@ func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.
 		if err = fileLockOrgToken.Acquire(); err != nil {
 			return "", errors.Wrap(err, "failed to acquire org token lock")
 		}
-		defer fileLockOrgToken.Release()
+		defer func() {
+			_ = fileLockOrgToken.Release()
+		}()
 		// check if an org token has been created since the lock was acquired
 		orgToken, err = GetOrgTokenIfExists(appInfo.AuthDomain)
 	}
@@ -215,19 +249,18 @@ func getToken(appURL *url.URL, appInfo *AppInfo, useHostOnly bool, log *zerolog.
 			return appToken, nil
 		}
 	}
-	return getTokensFromEdge(appURL, appInfo.AppAUD, appTokenPath, orgTokenPath, useHostOnly, log)
-
+	return getTokensFromEdge(appURL, appInfo.AppAUD, appTokenPath, orgTokenPath, useHostOnly, autoClose, isFedramp, log)
 }
 
 // getTokensFromEdge will attempt to use the transfer service to retrieve an app and org token, save them to disk,
 // and return the app token.
-func getTokensFromEdge(appURL *url.URL, appAUD, appTokenPath, orgTokenPath string, useHostOnly bool, log *zerolog.Logger) (string, error) {
+func getTokensFromEdge(appURL *url.URL, appAUD, appTokenPath, orgTokenPath string, useHostOnly bool, autoClose bool, isFedramp bool, log *zerolog.Logger) (string, error) {
 	// If no org token exists or if it couldn't be exchanged for an app token, then run the transfer service flow.
 
 	// this weird parameter is the resource name (token) and the key/value
 	// we want to send to the transfer service. the key is token and the value
 	// is blank (basically just the id generated in the transfer service)
-	resourceData, err := RunTransfer(appURL, appAUD, keyName, keyName, "", true, useHostOnly, log)
+	resourceData, err := RunTransfer(appURL, appAUD, keyName, keyName, "", true, useHostOnly, autoClose, isFedramp, log)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to run transfer service")
 	}
@@ -248,7 +281,6 @@ func getTokensFromEdge(appURL *url.URL, appAUD, appTokenPath, orgTokenPath strin
 	}
 
 	return resp.AppToken, nil
-
 }
 
 // GetAppInfo makes a request to the appURL and stops at the first redirect. The 302 location header will contain the
@@ -318,7 +350,6 @@ func handleRedirects(req *http.Request, via []*http.Request, orgToken string) er
 				}
 			}
 		}
-
 	}
 
 	// stop after hitting authorized endpoint since it will contain the app token
@@ -406,7 +437,6 @@ func GetAppTokenIfExists(appInfo *AppInfo) (string, error) {
 		return "", err
 	}
 	return token.CompactSerialize()
-
 }
 
 // GetTokenIfExists will return the token from local storage if it exists and not expired
@@ -415,7 +445,7 @@ func getTokenIfExists(path string) (*jose.JSONWebSignature, error) {
 	if err != nil {
 		return nil, err
 	}
-	token, err := jose.ParseSigned(string(content))
+	token, err := jose.ParseSigned(string(content), signatureAlgs)
 	if err != nil {
 		return nil, err
 	}

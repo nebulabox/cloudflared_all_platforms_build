@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -13,13 +14,16 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	cfdflow "github.com/cloudflare/cloudflared/flow"
+	"github.com/cloudflare/cloudflared/management"
+
 	"github.com/cloudflare/cloudflared/carrier"
 	"github.com/cloudflare/cloudflared/cfio"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/stream"
 	"github.com/cloudflare/cloudflared/tracing"
-	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
+	"github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
 const (
@@ -31,27 +35,27 @@ const (
 // Proxy represents a means to Proxy between cloudflared and the origin services.
 type Proxy struct {
 	ingressRules ingress.Ingress
-	warpRouting  *ingress.WarpRoutingService
-	management   *ingress.ManagementService
-	tags         []tunnelpogs.Tag
+	originDialer ingress.OriginTCPDialer
+	tags         []pogs.Tag
+	flowLimiter  cfdflow.Limiter
 	log          *zerolog.Logger
 }
 
 // NewOriginProxy returns a new instance of the Proxy struct.
 func NewOriginProxy(
 	ingressRules ingress.Ingress,
-	warpRouting ingress.WarpRoutingConfig,
-	tags []tunnelpogs.Tag,
-	writeTimeout time.Duration,
+	originDialer ingress.OriginDialer,
+	tags []pogs.Tag,
+	flowLimiter cfdflow.Limiter,
 	log *zerolog.Logger,
 ) *Proxy {
 	proxy := &Proxy{
 		ingressRules: ingressRules,
+		originDialer: originDialer,
 		tags:         tags,
+		flowLimiter:  flowLimiter,
 		log:          log,
 	}
-
-	proxy.warpRouting = ingress.NewWarpRoutingService(warpRouting, writeTimeout)
 
 	return proxy
 }
@@ -64,7 +68,7 @@ func (p *Proxy) applyIngressMiddleware(rule *ingress.Rule, r *http.Request, w co
 		}
 
 		if result.ShouldFilterRequest {
-			w.WriteRespHeaders(result.StatusCode, nil)
+			_ = w.WriteRespHeaders(result.StatusCode, nil)
 			return fmt.Errorf("request filtered by middleware handler (%s) due to: %s", handler.Name(), result.Reason), true
 		}
 	}
@@ -140,26 +144,35 @@ func (p *Proxy) ProxyHTTP(
 // ProxyTCP proxies to a TCP connection between the origin service and cloudflared.
 func (p *Proxy) ProxyTCP(
 	ctx context.Context,
-	rwa connection.ReadWriteAcker,
+	conn connection.ReadWriteAcker,
 	req *connection.TCPRequest,
 ) error {
 	incrementTCPRequests()
 	defer decrementTCPConcurrentRequests()
 
-	if p.warpRouting == nil {
-		err := errors.New(`cloudflared received a request from WARP client, but your configuration has disabled ingress from WARP clients. To enable this, set "warp-routing:\n\t enabled: true" in your config.yaml`)
-		p.log.Error().Msg(err.Error())
-		return err
+	logger := newTCPLogger(p.log, req)
+
+	// Try to start a new flow
+	if err := p.flowLimiter.Acquire(management.TCP.String()); err != nil {
+		logger.Warn().Msg("Too many concurrent flows being handled, rejecting tcp proxy")
+		return errors.Wrap(err, "failed to start tcp flow due to rate limiting")
 	}
+	defer p.flowLimiter.Release()
 
 	serveCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	logger := newTCPLogger(p.log, req)
 	tracedCtx := tracing.NewTracedContext(serveCtx, req.CfTraceID, &logger)
 	logger.Debug().Msg("tcp proxy stream started")
 
-	if err := p.proxyStream(tracedCtx, rwa, req.Dest, p.warpRouting.Proxy, &logger); err != nil {
+	// Parse the destination into a netip.AddrPort
+	dest, err := netip.ParseAddrPort(req.Dest)
+	if err != nil {
+		logRequestError(&logger, err)
+		return err
+	}
+
+	if err := p.proxyTCPStream(tracedCtx, conn, dest, p.originDialer, &logger); err != nil {
 		logRequestError(&logger, err)
 		return err
 	}
@@ -265,14 +278,14 @@ func (p *Proxy) proxyStream(
 	tr *tracing.TracedContext,
 	rwa connection.ReadWriteAcker,
 	dest string,
-	connectionProxy ingress.StreamBasedOriginProxy,
+	originDialer ingress.StreamBasedOriginProxy,
 	logger *zerolog.Logger,
 ) error {
 	ctx := tr.Context
 	_, connectSpan := tr.Tracer().Start(ctx, "stream-connect")
 
 	start := time.Now()
-	originConn, err := connectionProxy.EstablishConnection(ctx, dest, logger)
+	originConn, err := originDialer.EstablishConnection(ctx, dest, logger)
 	if err != nil {
 		connectStreamErrors.Inc()
 		tracing.EndWithErrorStatus(connectSpan, err)
@@ -293,6 +306,45 @@ func (p *Proxy) proxyStream(
 	logger.Debug().Msg("proxy stream acknowledged")
 
 	originConn.Stream(ctx, rwa, logger)
+	return nil
+}
+
+// proxyTCPStream proxies private network type TCP connections as a stream towards an available origin.
+//
+// This is different than proxyStream because it's not leveraged ingress rule services and uses the
+// originDialer from OriginDialerService.
+func (p *Proxy) proxyTCPStream(
+	tr *tracing.TracedContext,
+	tunnelConn connection.ReadWriteAcker,
+	dest netip.AddrPort,
+	originDialer ingress.OriginTCPDialer,
+	logger *zerolog.Logger,
+) error {
+	ctx := tr.Context
+	_, connectSpan := tr.Tracer().Start(ctx, "stream-connect")
+
+	start := time.Now()
+	originConn, err := originDialer.DialTCP(ctx, dest)
+	if err != nil {
+		connectStreamErrors.Inc()
+		tracing.EndWithErrorStatus(connectSpan, err)
+		return err
+	}
+	connectSpan.End()
+	defer originConn.Close()
+	logger.Debug().Msg("origin connection established")
+
+	encodedSpans := tr.GetSpans()
+
+	if err := tunnelConn.AckConnection(encodedSpans); err != nil {
+		connectStreamErrors.Inc()
+		return err
+	}
+
+	connectLatency.Observe(float64(time.Since(start).Milliseconds()))
+	logger.Debug().Msg("proxy stream acknowledged")
+
+	stream.Pipe(tunnelConn, originConn, logger)
 	return nil
 }
 

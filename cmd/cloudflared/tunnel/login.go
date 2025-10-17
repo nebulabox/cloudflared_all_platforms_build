@@ -12,6 +12,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
+	cfdflags "github.com/cloudflare/cloudflared/cmd/cloudflared/flags"
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/credentials"
 	"github.com/cloudflare/cloudflared/logger"
@@ -19,8 +20,31 @@ import (
 )
 
 const (
-	baseLoginURL     = "https://dash.cloudflare.com/argotunnel"
-	callbackStoreURL = "https://login.cloudflareaccess.org/"
+	baseLoginURL         = "https://dash.cloudflare.com/argotunnel"
+	callbackURL          = "https://login.cloudflareaccess.org/"
+	fedBaseLoginURL      = "https://dash.fed.cloudflare.com/argotunnel"
+	fedCallbackStoreURL  = "https://login.fed.cloudflareaccess.org/"
+	fedRAMPParamName     = "fedramp"
+	loginURLParamName    = "loginURL"
+	callbackURLParamName = "callbackURL"
+)
+
+var (
+	loginURL = &cli.StringFlag{
+		Name:  loginURLParamName,
+		Value: baseLoginURL,
+		Usage: "The URL used to login (default is https://dash.cloudflare.com/argotunnel)",
+	}
+	callbackStore = &cli.StringFlag{
+		Name:  callbackURLParamName,
+		Value: callbackURL,
+		Usage: "The URL used for the callback (default is https://login.cloudflareaccess.org/)",
+	}
+	fedramp = &cli.BoolFlag{
+		Name:    fedRAMPParamName,
+		Aliases: []string{"f"},
+		Usage:   "Login with FedRAMP High environment.",
+	}
 )
 
 func buildLoginSubcommand(hidden bool) *cli.Command {
@@ -30,6 +54,11 @@ func buildLoginSubcommand(hidden bool) *cli.Command {
 		Usage:     "Generate a configuration file with your login details",
 		ArgsUsage: " ",
 		Hidden:    hidden,
+		Flags: []cli.Flag{
+			loginURL,
+			callbackStore,
+			fedramp,
+		},
 	}
 }
 
@@ -38,15 +67,25 @@ func login(c *cli.Context) error {
 
 	path, ok, err := checkForExistingCert()
 	if ok {
-		fmt.Fprintf(os.Stdout, "You have an existing certificate at %s which login would overwrite.\nIf this is intentional, please move or delete that file then run this command again.\n", path)
+		log.Error().Err(err).Msgf("You have an existing certificate at %s which login would overwrite.\nIf this is intentional, please move or delete that file then run this command again.\n", path)
 		return nil
 	} else if err != nil {
 		return err
 	}
 
-	loginURL, err := url.Parse(baseLoginURL)
+	var (
+		baseloginURL     = c.String(loginURLParamName)
+		callbackStoreURL = c.String(callbackURLParamName)
+	)
+
+	isFEDRamp := c.Bool(fedRAMPParamName)
+	if isFEDRamp {
+		baseloginURL = fedBaseLoginURL
+		callbackStoreURL = fedCallbackStoreURL
+	}
+
+	loginURL, err := url.Parse(baseloginURL)
 	if err != nil {
-		// shouldn't happen, URL is hardcoded
 		return err
 	}
 
@@ -58,10 +97,28 @@ func login(c *cli.Context) error {
 		callbackStoreURL,
 		false,
 		false,
+		c.Bool(cfdflags.AutoCloseInterstitial),
+		isFEDRamp,
 		log,
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write the certificate due to the following error:\n%v\n\nYour browser will download the certificate instead. You will have to manually\ncopy it to the following path:\n\n%s\n", err, path)
+		log.Error().Err(err).Msgf("Failed to write the certificate.\n\nYour browser will download the certificate instead. You will have to manually\ncopy it to the following path:\n\n%s\n", path)
+		return err
+	}
+
+	cert, err := credentials.DecodeOriginCert(resourceData)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to decode origin certificate")
+		return err
+	}
+
+	if isFEDRamp {
+		cert.Endpoint = credentials.FedEndpoint
+	}
+
+	resourceData, err = cert.EncodeOriginCert()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode origin certificate")
 		return err
 	}
 
@@ -69,7 +126,7 @@ func login(c *cli.Context) error {
 		return errors.Wrap(err, fmt.Sprintf("error writing cert to %s", path))
 	}
 
-	fmt.Fprintf(os.Stdout, "You have successfully logged in.\nIf you wish to copy your credentials to a server, they have been saved to:\n%s\n", path)
+	log.Info().Msgf("You have successfully logged in.\nIf you wish to copy your credentials to a server, they have been saved to:\n%s\n", path)
 	return nil
 }
 

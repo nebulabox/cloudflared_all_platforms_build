@@ -1,8 +1,6 @@
 package connection
 
 import (
-	"github.com/cloudflare/cloudflared/edgediscovery"
-	"github.com/cloudflare/cloudflared/h2mux"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
 )
 
@@ -54,28 +52,26 @@ func serverRegistrationErrorFromRPC(err error) ServerRegisterTunnelError {
 	}
 }
 
-type muxerShutdownError struct{}
+type ControlStreamError struct{}
 
-func (e muxerShutdownError) Error() string {
-	return "muxer shutdown"
+var _ error = &ControlStreamError{}
+
+func (e *ControlStreamError) Error() string {
+	return "control stream encountered a failure while serving"
 }
 
-var errMuxerStopped = muxerShutdownError{}
+type StreamListenerError struct{}
 
-func isHandshakeErrRecoverable(err error, connIndex uint8, observer *Observer) bool {
-	log := observer.log.With().
-		Uint8(LogFieldConnIndex, connIndex).
-		Err(err).
-		Logger()
+var _ error = &StreamListenerError{}
 
-	switch err.(type) {
-	case edgediscovery.DialError:
-		log.Error().Msg("Connection unable to dial edge")
-	case h2mux.MuxerHandshakeError:
-		log.Error().Msg("Connection handshake with edge server failed")
-	default:
-		log.Error().Msg("Connection failed")
-		return false
-	}
-	return true
+func (e *StreamListenerError) Error() string {
+	return "accept stream listener encountered a failure while serving"
+}
+
+type DatagramManagerError struct{}
+
+var _ error = &DatagramManagerError{}
+
+func (e *DatagramManagerError) Error() string {
+	return "datagram manager encountered a failure while serving"
 }

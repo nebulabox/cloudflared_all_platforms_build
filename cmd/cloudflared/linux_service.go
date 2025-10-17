@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/rs/zerolog"
@@ -15,7 +16,7 @@ import (
 	"github.com/cloudflare/cloudflared/logger"
 )
 
-func runApp(app *cli.App, graceShutdownC chan struct{}) {
+func runApp(app *cli.App, _ chan struct{}) {
 	app.Commands = append(app.Commands, &cli.Command{
 		Name:  "service",
 		Usage: "Manages the cloudflared system service",
@@ -35,7 +36,7 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 			},
 		},
 	})
-	app.Run(os.Args)
+	_ = app.Run(os.Args)
 }
 
 // The directory and files that are used by the service.
@@ -55,7 +56,8 @@ var systemdAllTemplates = map[string]ServiceTemplate{
 		Path: fmt.Sprintf("/etc/systemd/system/%s", cloudflaredService),
 		Content: `[Unit]
 Description=cloudflared
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 TimeoutStartSec=0
@@ -72,7 +74,8 @@ WantedBy=multi-user.target
 		Path: fmt.Sprintf("/etc/systemd/system/%s", cloudflaredUpdateService),
 		Content: `[Unit]
 Description=Update cloudflared
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/bin/bash -c '{{ .Path }} update; code=$?; if [ $code -eq 11 ]; then systemctl restart cloudflared; exit 0; fi; exit $code'
@@ -95,6 +98,7 @@ WantedBy=timers.target
 var sysvTemplate = ServiceTemplate{
 	Path:     "/etc/init.d/cloudflared",
 	FileMode: 0755,
+	// nolint: dupword
 	Content: `#!/bin/sh
 # For RedHat and cousins:
 # chkconfig: 2345 99 01
@@ -182,13 +186,11 @@ exit 0
 `,
 }
 
-var (
-	noUpdateServiceFlag = &cli.BoolFlag{
-		Name:  "no-update-service",
-		Usage: "Disable auto-update of the cloudflared linux service, which restarts the server to upgrade for new versions.",
-		Value: false,
-	}
-)
+var noUpdateServiceFlag = &cli.BoolFlag{
+	Name:  "no-update-service",
+	Usage: "Disable auto-update of the cloudflared linux service, which restarts the server to upgrade for new versions.",
+	Value: false,
+}
 
 func isSystemd() bool {
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
@@ -426,5 +428,40 @@ func uninstallSysv(log *zerolog.Logger) error {
 			continue
 		}
 	}
+	return nil
+}
+
+func ensureConfigDirExists(configDir string) error {
+	ok, err := config.FileExists(configDir)
+	if !ok && err == nil {
+		err = os.Mkdir(configDir, 0755)
+	}
+	return err
+}
+
+func copyFile(src, dest string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		destFile.Close()
+		if !ok {
+			_ = os.Remove(dest)
+		}
+	}()
+
+	if _, err := io.Copy(destFile, srcFile); err != nil {
+		return err
+	}
+
+	ok = true
 	return nil
 }

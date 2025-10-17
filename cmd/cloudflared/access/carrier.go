@@ -47,6 +47,7 @@ func StartForwarder(forwarder config.Forwarder, shutdown <-chan struct{}, log *z
 	options := &carrier.StartOptions{
 		OriginURL: forwarder.URL,
 		Headers:   headers, //TODO: TUN-2688 support custom headers from config file
+		IsFedramp: forwarder.IsFedramp,
 	}
 
 	// we could add a cmd line variable for this bool if we want the SOCK5 server to be on the client side
@@ -92,6 +93,7 @@ func ssh(c *cli.Context) error {
 		OriginURL: url.String(),
 		Headers:   headers,
 		Host:      url.Host,
+		IsFedramp: c.Bool(fedrampFlag),
 	}
 
 	if connectTo := c.String(sshConnectTo); connectTo != "" {
@@ -104,7 +106,7 @@ func ssh(c *cli.Context) error {
 		case 3:
 			options.OriginURL = fmt.Sprintf("https://%s:%s", parts[2], parts[1])
 			options.TLSClientConfig = &tls.Config{
-				InsecureSkipVerify: true,
+				InsecureSkipVerify: true, // #nosec G402
 				ServerName:         parts[0],
 			}
 			log.Warn().Msgf("Using insecure SSL connection because SNI overridden to %s", parts[0])
@@ -141,6 +143,5 @@ func ssh(c *cli.Context) error {
 		logger := log.With().Str("host", url.Host).Logger()
 		s = stream.NewDebugStream(s, &logger, maxMessages)
 	}
-	carrier.StartClient(wsConn, s, options)
-	return nil
+	return carrier.StartClient(wsConn, s, options)
 }

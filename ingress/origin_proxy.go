@@ -2,7 +2,9 @@ package ingress
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 
 	"github.com/rs/zerolog"
@@ -48,12 +50,31 @@ func (o *httpService) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Host = o.hostHeader
 	}
+
+	if o.matchSNIToHost {
+		o.SetOriginServerName(req)
+	}
+
 	return o.transport.RoundTrip(req)
+}
+
+func (o *httpService) SetOriginServerName(req *http.Request) {
+	o.transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := o.transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return tls.Client(conn, &tls.Config{
+			RootCAs:            o.transport.TLSClientConfig.RootCAs,
+			InsecureSkipVerify: o.transport.TLSClientConfig.InsecureSkipVerify, // nolint: gosec
+			ServerName:         req.Host,
+		}), nil
+	}
 }
 
 func (o *statusCode) RoundTrip(_ *http.Request) (*http.Response, error) {
 	if o.defaultResp {
-		o.log.Warn().Msgf(ErrNoIngressRulesCLI.Error())
+		o.log.Warn().Msg(ErrNoIngressRulesCLI.Error())
 	}
 	resp := &http.Response{
 		StatusCode: o.code,
@@ -93,7 +114,6 @@ func (o *tcpOverWSService) EstablishConnection(ctx context.Context, dest string,
 		streamHandler: o.streamHandler,
 	}
 	return originConn, nil
-
 }
 
 func (o *socksProxyOverWSService) EstablishConnection(_ context.Context, _ string, _ *zerolog.Logger) (OriginConnection, error) {
